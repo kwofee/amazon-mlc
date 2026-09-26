@@ -3086,7 +3086,35 @@ Currently running: all 5 folds in parallel (sample modulo 500, ~880-913 anchors 
 
 Plan: concatenate folds 0-3 for training (~3,500 anchors, ~12K pos, ~70K neg), fold 4 for held-out validation (~3K pos, ~18K neg). Train HistGradientBoostingClassifier, evaluate pairwise metrics + entity-level macro F0.5.
 
-### 35.18 Next steps
+### 35.18 BM25 batched postings optimization (2026-09-26)
+
+Per-step profiling of 10 sample anchors revealed BM25 route consumed ~82% of blocker time.
+
+Root cause: `bm25_candidates()` in `indexing.py` fired one SQLite query per query token in a Python loop (`SELECT entity_id FROM token_postings WHERE … AND token=?`). With ~3 tokens per BM25 call and 4 calls per anchor (name+address × S2+S3), that was ~12 round-trips per anchor.
+
+Fixes applied:
+1. **Batched postings query**: replaced N per-token queries with single `SELECT token, entity_id … WHERE token IN (…)`. One round-trip per BM25 call instead of N. (`indexing.py:699`)
+2. **Cached `corpus_size`**: added `@lru_cache` on `corpus_size()` — was hitting `SELECT COUNT(*)` on exact_postings every BM25 call. (`indexing.py:591`)
+3. Note: `token_stats` table is already WITHOUT ROWID with PK `(country, source, field, token)`, so it has a clustered B-tree index. A separate secondary index was tried and found redundant (dropped).
+
+Benchmark (10 anchors, warm cache, single process):
+- Before: median ~1800ms/anchor (blocker only)
+- After: median 717ms/anchor, mean 856ms/anchor
+- Variance 14ms–1778ms due to 14.3GB total DB size vs 16GB system RAM (OS page cache pressure)
+
+Sub-step breakdown (after fix):
+- Blocker (all 5 routes): 98.5% of time
+- SQLite record lookup: 0.5%
+- Feature extraction: 1.0%
+- Normalization: 0.0%
+
+Projected test set (1.73M anchors, median-based):
+- 5 processes: ~69 hours
+- 10 processes: ~34.5 hours
+
+Remaining bottleneck is disk I/O on 14.3GB of SQLite databases that cannot fit in the machine's page cache. Further optimization would require reducing DB size (e.g., integer entity IDs instead of strings) or country-partitioned databases.
+
+### 35.19 Next steps
 
 1. Wait for fold pair generation to complete (~20-25 min with 5 concurrent processes)
 2. Concatenate folds 0-3 into training set, fold 4 as validation

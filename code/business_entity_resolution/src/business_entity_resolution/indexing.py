@@ -6,6 +6,7 @@ import json
 import logging
 import math
 import sqlite3
+from functools import lru_cache
 from collections import Counter, defaultdict
 from dataclasses import dataclass
 from pathlib import Path
@@ -507,6 +508,11 @@ class TargetIndex:
     def __init__(self, database_path: str | Path):
         self.connection = sqlite3.connect(Path(database_path))
         self.connection.row_factory = sqlite3.Row
+        self.connection.execute("PRAGMA mmap_size=8589934592")
+        self.connection.execute("PRAGMA cache_size=-1048576")
+        self.connection.execute("PRAGMA journal_mode=WAL")
+        self.connection.execute("PRAGMA synchronous=OFF")
+        self._ngram_table_exists: Optional[bool] = None
 
     def close(self) -> None:
         self.connection.close()
@@ -556,6 +562,7 @@ class TargetIndex:
         except sqlite3.OperationalError:
             return False
 
+    @lru_cache(maxsize=None)
     def sources(self) -> Tuple[str, ...]:
         rows = self.connection.execute(
             "SELECT DISTINCT source FROM exact_postings ORDER BY source"
@@ -587,6 +594,7 @@ class TargetIndex:
             entity_ids=tuple(row["entity_id"] for row in rows),
         )
 
+    @lru_cache(maxsize=None)
     def corpus_size(self, country: str, source: str) -> int:
         """Number of distinct entity_ids indexed for this country/source."""
         row = self.connection.execute(
@@ -608,26 +616,32 @@ class TargetIndex:
         token_values = sorted(set(token for token in tokens if token))
         if not token_values:
             return tuple()
-        token_frequencies: List[Tuple[str, int]] = []
-        for token in token_values:
-            row = self.connection.execute(
-                "SELECT document_frequency FROM token_stats "
-                "WHERE country=? AND source=? AND field=? AND token=?",
-                (country, source, field, token),
-            ).fetchone()
-            if row is not None and row["document_frequency"] <= maximum_document_frequency:
-                token_frequencies.append((token, row["document_frequency"]))
-        token_frequencies.sort(key=lambda item: (item[1], item[0]))
+        ph = ",".join("?" for _ in token_values)
+        stats_rows = self.connection.execute(
+            f"SELECT token, document_frequency FROM token_stats "
+            f"WHERE country=? AND source=? AND field=? AND token IN ({ph})",
+            (country, source, field, *token_values),
+        ).fetchall()
+        token_df_map = {
+            row["token"]: row["document_frequency"]
+            for row in stats_rows
+            if row["document_frequency"] <= maximum_document_frequency
+        }
+        if not token_df_map:
+            return tuple()
 
+        rare_tokens = list(token_df_map.keys())
+        ph2 = ",".join("?" for _ in rare_tokens)
+        rows = self.connection.execute(
+            f"SELECT token, entity_id FROM token_postings "
+            f"WHERE country=? AND source=? AND field=? AND token IN ({ph2})",
+            (country, source, field, *rare_tokens),
+        )
         support: DefaultDict[str, List[Tuple[str, int]]] = defaultdict(list)
-        for token, document_frequency in token_frequencies:
-            rows = self.connection.execute(
-                "SELECT entity_id FROM token_postings "
-                "WHERE country=? AND source=? AND field=? AND token=?",
-                (country, source, field, token),
+        for row in rows:
+            support[row["entity_id"]].append(
+                (row["token"], token_df_map[row["token"]])
             )
-            for row in rows:
-                support[row["entity_id"]].append((token, document_frequency))
 
         candidates = [
             RareCandidate(
@@ -698,16 +712,17 @@ class TargetIndex:
 
         entity_scores: DefaultDict[str, float] = defaultdict(float)
         entity_hits: Counter[str] = Counter()
-        for token, idf in token_idfs.items():
-            rows = self.connection.execute(
-                "SELECT entity_id FROM token_postings "
-                "WHERE country=? AND source=? AND field=? AND token=?",
-                (country, source, field, token),
-            )
-            for row in rows:
-                eid = row["entity_id"]
-                entity_scores[eid] += idf
-                entity_hits[eid] += 1
+        idf_tokens = list(token_idfs.keys())
+        ph = ",".join("?" for _ in idf_tokens)
+        rows = self.connection.execute(
+            f"SELECT token, entity_id FROM token_postings "
+            f"WHERE country=? AND source=? AND field=? AND token IN ({ph})",
+            (country, source, field, *idf_tokens),
+        )
+        for row in rows:
+            idf = token_idfs[row["token"]]
+            entity_scores[row["entity_id"]] += idf
+            entity_hits[row["entity_id"]] += 1
 
         candidates = [
             BM25Candidate(
@@ -736,15 +751,16 @@ class TargetIndex:
         if len(numeric_set) < min_shared_numbers:
             return ()
 
+        num_list = sorted(numeric_set)
+        ph = ",".join("?" for _ in num_list)
+        rows = self.connection.execute(
+            f"SELECT token, entity_id FROM token_postings "
+            f"WHERE country=? AND source=? AND field='numeric' AND token IN ({ph})",
+            (country, source, *num_list),
+        )
         entity_num_hits: DefaultDict[str, Set[str]] = defaultdict(set)
-        for token in numeric_set:
-            rows = self.connection.execute(
-                "SELECT entity_id FROM token_postings "
-                "WHERE country=? AND source=? AND field='numeric' AND token=?",
-                (country, source, token),
-            )
-            for row in rows:
-                entity_num_hits[row["entity_id"]].add(token)
+        for row in rows:
+            entity_num_hits[row["entity_id"]].add(row["token"])
 
         qualifying = {
             eid: shared
@@ -780,19 +796,24 @@ class TargetIndex:
             candidates.sort(key=lambda c: (-c.score, c.entity_id))
             return tuple(candidates[:limit])
 
+        useful_list = sorted(useful_set)
+        ph2 = ",".join("?" for _ in useful_list)
+        stats_rows = self.connection.execute(
+            f"SELECT token FROM token_stats "
+            f"WHERE country=? AND source=? AND field='address_useful' "
+            f"AND token IN ({ph2}) AND document_frequency <= 50000",
+            (country, source, *useful_list),
+        ).fetchall()
+        eligible_tokens = [r["token"] for r in stats_rows]
+
         entity_addr_hits: Set[str] = set()
-        for token in useful_set:
-            row = self.connection.execute(
-                "SELECT document_frequency FROM token_stats "
-                "WHERE country=? AND source=? AND field='address_useful' AND token=?",
-                (country, source, token),
-            ).fetchone()
-            if row is None or row["document_frequency"] > 50_000:
-                continue
+        if eligible_tokens:
+            ph3 = ",".join("?" for _ in eligible_tokens)
             rows = self.connection.execute(
-                "SELECT entity_id FROM token_postings "
-                "WHERE country=? AND source=? AND field='address_useful' AND token=?",
-                (country, source, token),
+                f"SELECT entity_id FROM token_postings "
+                f"WHERE country=? AND source=? AND field='address_useful' "
+                f"AND token IN ({ph3})",
+                (country, source, *eligible_tokens),
             )
             for r in rows:
                 entity_addr_hits.add(r["entity_id"])
@@ -825,34 +846,33 @@ class TargetIndex:
         if not query_grams:
             return ()
 
-        has_table = self.connection.execute(
-            "SELECT COUNT(*) FROM sqlite_master WHERE type='table' AND name='ngram_stats'"
-        ).fetchone()[0]
-        if not has_table:
+        if self._ngram_table_exists is None:
+            self._ngram_table_exists = bool(self.connection.execute(
+                "SELECT COUNT(*) FROM sqlite_master WHERE type='table' AND name='ngram_stats'"
+            ).fetchone()[0])
+        if not self._ngram_table_exists:
             return ()
 
-        eligible_grams = []
-        for gram in query_grams:
-            row = self.connection.execute(
-                "SELECT document_frequency FROM ngram_stats "
-                "WHERE country=? AND source=? AND field=? AND ngram=?",
-                (country, source, field, gram),
-            ).fetchone()
-            if row is not None:
-                eligible_grams.append(gram)
-
+        gram_list = sorted(set(query_grams))
+        ph = ",".join("?" for _ in gram_list)
+        stats_rows = self.connection.execute(
+            f"SELECT ngram FROM ngram_stats "
+            f"WHERE country=? AND source=? AND field=? AND ngram IN ({ph})",
+            (country, source, field, *gram_list),
+        ).fetchall()
+        eligible_grams = [r["ngram"] for r in stats_rows]
         if not eligible_grams:
             return ()
 
+        ph2 = ",".join("?" for _ in eligible_grams)
+        rows = self.connection.execute(
+            f"SELECT ngram, entity_id FROM ngram_postings "
+            f"WHERE country=? AND source=? AND field=? AND ngram IN ({ph2})",
+            (country, source, field, *eligible_grams),
+        )
         entity_shared: Counter[str] = Counter()
-        for gram in eligible_grams:
-            rows = self.connection.execute(
-                "SELECT entity_id FROM ngram_postings "
-                "WHERE country=? AND source=? AND field=? AND ngram=?",
-                (country, source, field, gram),
-            )
-            for row in rows:
-                entity_shared[row["entity_id"]] += 1
+        for row in rows:
+            entity_shared[row["entity_id"]] += 1
 
         query_size = len(query_grams)
         candidates = []
