@@ -1,0 +1,24 @@
+# OS
+.DS_Store
+__pycache__/
+*.pyc
+
+# Dataset (too large for git, ~2.4GB)
+dataset/
+
+# SQLite indexes (generated artifacts, multi-GB)
+*.sqlite
+*.sqlite-shm
+*.sqlite-wal
+*.sqlite-journal
+
+# Fold assignments (generated, can be reproduced)
+code/business_entity_resolution/artifacts/folds/
+
+# Python bytecode cache
+/tmp/ber_pycache/
+
+# Editor / IDE
+.vscode/
+.idea/
+*.swp
