@@ -2994,14 +2994,106 @@ The n-gram route contributed the most unique positive hits of any single route (
 - S2: 95.0% (1,457/1,534)
 - S3: 94.3% (1,547/1,641)
 
-### 35.13 Current limitations and next action
+### 35.13 Current limitations
 
 - S2 index is 98.9% complete (missing ~56K records from corruption recovery). Impact on recall is likely small but should be noted.
 - Cross-script/transliteration retrieval not implemented. India recall (93.5%) is lower than US (95.4%), partly due to Devanagari targets that share no Latin character overlap.
 - No embedding-based retrieval yet (would help cross-script and semantic matching).
-- Pair features, matching model, and global decoder not implemented.
 - The fold generator uses approximate deterministic hash stratification rather than an exactly balanced allocation within each stratum.
 - Postal fallback rules are conservative heuristics and need a manual/error audit on true pairs before being treated as contradiction evidence.
 - The remaining ~5.4% missed pairs likely include cross-script matches, very short/generic names, and records with empty addresses — these may need transliteration, sibling graph, or embedding retrieval.
 
-**Blocking stage is substantially complete** with 94.6% pair recall at 288 mean candidates/anchor across all 5 retrieval routes. The next implementation milestone is pairwise feature extraction and matching model training using hard negatives mined from the blocker's candidate pools.
+### 35.14 Pairwise feature extraction (2026-09-26)
+
+New module `features.py` with 31 pairwise features for (anchor, target) pair scoring:
+
+**Name features (14):** name_exact_full, name_exact_core, name_exact_sorted, name_token_jaccard, name_core_token_jaccard, name_char_trigram_dice, name_char_4gram_dice, name_edit_ratio, name_length_ratio, name_shared_core_count, name_core_token_count_anchor, name_core_token_count_target, name_acronym_match.
+
+**Address features (8):** addr_exact_full, addr_token_jaccard, addr_useful_token_jaccard, addr_char_trigram_dice, addr_length_ratio, addr_shared_useful_count, addr_useful_token_count_anchor, addr_useful_token_count_target.
+
+**Numeric/postal features (5):** num_shared_count, num_anchor_count, num_target_count, num_jaccard, postal_match, postal_either_present.
+
+**Metadata features (4):** target_addr_missing, is_s2, script_mismatch, route_count.
+
+Edit distance uses full O(nm) Levenshtein on core-ordered name strings. Character n-gram features use trigrams (separate from the 4-5 gram index n-grams). Script mismatch detects Latin vs Devanagari disagreement.
+
+### 35.15 Matching model pipeline (2026-09-26)
+
+New module `matching.py` — candidate pair generation + HistGradientBoostingClassifier training.
+
+**Pair generation workflow:**
+1. Load fold anchors from `train_folds.tsv` (filtered by fold number and optional sample modulo)
+2. Load S1 anchor records (name, address) by streaming `train_source1.tsv`
+3. Load ground truth match sets from `train_ground_truth.tsv`
+4. For each anchor: run 5-route blocker against S2+S3 SQLite indexes → candidate set
+5. Batch-fetch candidate target records from `raw_records` table in SQLite (NOT from a 4GB in-memory dict — see 35.16)
+6. Label: positive if target_id in ground truth, negative otherwise
+7. Sample up to 20 hard negatives per anchor (ranked by route_count — highest first, i.e., hardest to distinguish from true matches)
+8. Extract 31 pairwise features, write to TSV
+
+**Model training:** HistGradientBoostingClassifier (scikit-learn 1.4.1), 500 iterations, max_depth=6, min_samples_leaf=50. Supports train/val split via separate pair files.
+
+**Smoke test result (fold 0, sample modulo 10000 = 49 anchors):**
+- Train AUC: 0.9995, precision: 0.9936, recall: 0.9451, F1: 0.9688
+
+**Preliminary model v1 (fold 0, sample modulo 500 = 913 anchors):**
+- 21,264 pairs (3,004 positive, 18,260 negative)
+- Train AUC: 1.0, precision: 0.999, recall: 0.996, F1: 0.998
+- Note: train-only metrics, no validation yet. Near-perfect train AUC expected — model can separate matches from hard negatives on seen data.
+
+CLI commands: `generate-training-pairs`, `train-matcher`.
+
+### 35.16 SQLite raw_records optimization (2026-09-26)
+
+**Problem:** Original pair generation loaded all 10.3M target records into a Python dict (~4GB RAM). With multiple concurrent processes on 16GB machine, memory pressure caused SQLite page cache thrashing → 18s/anchor average.
+
+**Fix:** Added `raw_records` table to existing SQLite indexes (entity_id, business_name, business_address, country). Target text is now fetched via `get_records_batch()` — batched `SELECT ... WHERE entity_id IN (...)` query, ~0.3ms per batch of ~20 records.
+
+**Populate:** `populate-raw-records` CLI command. Streams TSV, inserts in 50K batches. S2: 5,034,616 rows in ~90s. S3: 5,285,603 rows in ~90s.
+
+**Benchmark (76 anchors, no contention):**
+
+| Component | Time |
+|---|---:|
+| Blocker (5 routes × 2 sources) | 780ms |
+| SQLite batch lookup (~20 records) | 0.3ms |
+| Feature extraction (~20 pairs) | 10ms |
+| **Total per anchor** | **791ms** |
+
+**Before vs after:**
+
+| Metric | Before (4GB dict) | After (SQLite) |
+|---|---|---|
+| Startup time | 50s | 0s |
+| RAM per process | ~4GB | ~17MB |
+| Per-anchor time (no contention) | ~2s | ~0.8s |
+| Per-anchor time (3 concurrent) | ~18s (thrashing) | ~0.8s (no thrashing) |
+| 900 anchors (1 fold sample) | ~4.5 hours | ~12 minutes |
+
+**Key insight:** The blocker itself is fast (~800ms). The old slowness was entirely caused by OS memory pressure from the 4GB dict evicting SQLite page cache. With raw_records in SQLite, the OS file cache is shared across processes.
+
+### 35.17 Training pair generation status (2026-09-26)
+
+Currently running: all 5 folds in parallel (sample modulo 500, ~880-913 anchors per fold).
+
+| Fold | Purpose | Anchors (approx) |
+|---|---|---|
+| 0 | Training | 884 |
+| 1 | Training | 882 |
+| 2 | Training | 881 |
+| 3 | Training | 885 |
+| 4 | Validation | 882 |
+
+Plan: concatenate folds 0-3 for training (~3,500 anchors, ~12K pos, ~70K neg), fold 4 for held-out validation (~3K pos, ~18K neg). Train HistGradientBoostingClassifier, evaluate pairwise metrics + entity-level macro F0.5.
+
+### 35.18 Next steps
+
+1. Wait for fold pair generation to complete (~20-25 min with 5 concurrent processes)
+2. Concatenate folds 0-3 into training set, fold 4 as validation
+3. Train matcher v2 with train/val split
+4. Evaluate entity-level macro F0.5 on fold 4 (the competition metric)
+5. Threshold tuning — optimize for F0.5 (precision-weighted)
+6. Global decoder — enforce target-to-anchor exclusivity
+7. Source-specific calibration (S2 vs S3 corruption patterns differ)
+8. Cross-script/transliteration retrieval for Devanagari targets
+9. France zero-shot transfer
