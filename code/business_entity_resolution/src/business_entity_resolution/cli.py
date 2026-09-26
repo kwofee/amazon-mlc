@@ -9,7 +9,8 @@ from pathlib import Path
 from typing import Sequence
 
 from .folds import generate_grouped_folds
-from .indexing import build_ngram_index, build_target_index
+from .indexing import build_ngram_index, build_target_index, populate_raw_records
+from .matching import generate_training_pairs, train_matcher
 from .metrics import score_files
 from .recall import evaluate_exact_rare_recall
 
@@ -90,6 +91,42 @@ def _parser() -> argparse.ArgumentParser:
         "--max-rows-per-file", type=int,
         help="optional prefix size for shard builds",
     )
+    populate = subparsers.add_parser(
+        "populate-raw-records",
+        help="store raw target records in the SQLite index for fast lookup",
+    )
+    populate.add_argument("--database", required=True)
+    populate.add_argument("--targets", required=True, nargs="+")
+
+    pairs = subparsers.add_parser(
+        "generate-training-pairs",
+        help="generate labeled training pairs from blocker candidates",
+    )
+    pairs.add_argument("--index", required=True, nargs="+")
+    pairs.add_argument("--fold-file", required=True)
+    pairs.add_argument("--source1", required=True)
+    pairs.add_argument("--ground-truth", required=True)
+    pairs.add_argument("--output", required=True)
+    pairs.add_argument("--fold", type=int, default=0)
+    pairs.add_argument("--sample-modulo", type=int)
+    pairs.add_argument("--sample-remainder", type=int, default=0)
+    pairs.add_argument("--negatives-per-anchor", type=int, default=20)
+    pairs.add_argument("--max-document-frequency", type=int, default=5_000)
+    pairs.add_argument("--bm25-max-token-df", type=int, default=5_000)
+    pairs.add_argument("--progress-every", type=int, default=500)
+
+    train = subparsers.add_parser(
+        "train-matcher",
+        help="train HistGradientBoostingClassifier on generated pairs",
+    )
+    train.add_argument("--train-pairs", required=True)
+    train.add_argument("--model-output", required=True)
+    train.add_argument("--val-pairs")
+    train.add_argument("--max-iter", type=int, default=500)
+    train.add_argument("--learning-rate", type=float, default=0.1)
+    train.add_argument("--max-depth", type=int, default=6)
+    train.add_argument("--min-samples-leaf", type=int, default=50)
+
     return parser
 
 
@@ -167,6 +204,36 @@ def main(argv: Sequence[str] | None = None) -> int:
             ngram_min=arguments.ngram_min,
             ngram_max=arguments.ngram_max,
             maximum_rows_per_file=arguments.max_rows_per_file,
+        )
+    elif arguments.command == "populate-raw-records":
+        result = populate_raw_records(
+            database_path=arguments.database,
+            target_paths=arguments.targets,
+        )
+    elif arguments.command == "generate-training-pairs":
+        result = generate_training_pairs(
+            index_paths=arguments.index,
+            fold_path=arguments.fold_file,
+            source1_path=arguments.source1,
+            ground_truth_path=arguments.ground_truth,
+            output_path=arguments.output,
+            fold=arguments.fold,
+            sample_modulo=arguments.sample_modulo,
+            sample_remainder=arguments.sample_remainder,
+            negatives_per_anchor=arguments.negatives_per_anchor,
+            max_df=arguments.max_document_frequency,
+            bm25_max_token_df=arguments.bm25_max_token_df,
+            progress_every=arguments.progress_every,
+        )
+    elif arguments.command == "train-matcher":
+        result = train_matcher(
+            train_pairs_path=arguments.train_pairs,
+            model_output_path=arguments.model_output,
+            val_pairs_path=arguments.val_pairs,
+            max_iter=arguments.max_iter,
+            learning_rate=arguments.learning_rate,
+            max_depth=arguments.max_depth,
+            min_samples_leaf=arguments.min_samples_leaf,
         )
     else:
         raise AssertionError(f"unhandled command: {arguments.command}")

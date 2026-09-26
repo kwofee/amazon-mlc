@@ -110,6 +110,13 @@ def initialize_index_database(connection: sqlite3.Connection) -> None:
             key TEXT PRIMARY KEY,
             value TEXT NOT NULL
         ) WITHOUT ROWID;
+
+        CREATE TABLE IF NOT EXISTS raw_records (
+            entity_id TEXT PRIMARY KEY,
+            business_name TEXT NOT NULL,
+            business_address TEXT NOT NULL,
+            country TEXT NOT NULL
+        ) WITHOUT ROWID;
         """
     )
     connection.commit()
@@ -441,6 +448,61 @@ def build_ngram_index(
     }
 
 
+def populate_raw_records(
+    database_path: str | Path,
+    target_paths: Sequence[str | Path],
+    batch_size: int = 50_000,
+) -> dict:
+    """Insert raw target records into the raw_records table."""
+    db = Path(database_path)
+    connection = sqlite3.connect(db)
+    connection.execute("PRAGMA journal_mode=WAL")
+    connection.execute("PRAGMA synchronous=NORMAL")
+    connection.execute("PRAGMA cache_size=-262144")
+    connection.execute(
+        "CREATE TABLE IF NOT EXISTS raw_records ("
+        "entity_id TEXT PRIMARY KEY, "
+        "business_name TEXT NOT NULL, "
+        "business_address TEXT NOT NULL, "
+        "country TEXT NOT NULL"
+        ") WITHOUT ROWID"
+    )
+    connection.commit()
+
+    total = 0
+    batch: List[Tuple[str, str, str, str]] = []
+    for tp in target_paths:
+        LOGGER.info("loading raw records from %s", tp)
+        for row in iter_source_rows(tp):
+            batch.append((
+                row["entity_id"],
+                row["business_name"],
+                row["business_address"],
+                row["country"],
+            ))
+            if len(batch) >= batch_size:
+                connection.executemany(
+                    "INSERT OR IGNORE INTO raw_records VALUES (?,?,?,?)", batch
+                )
+                connection.commit()
+                total += len(batch)
+                batch.clear()
+                if total % 500_000 == 0:
+                    LOGGER.info("  inserted %s raw records", f"{total:,}")
+    if batch:
+        connection.executemany(
+            "INSERT OR IGNORE INTO raw_records VALUES (?,?,?,?)", batch
+        )
+        connection.commit()
+        total += len(batch)
+
+    count = connection.execute("SELECT COUNT(*) FROM raw_records").fetchone()[0]
+    connection.execute("PRAGMA journal_mode=DELETE")
+    connection.close()
+    LOGGER.info("raw_records populated: %s rows", f"{count:,}")
+    return {"raw_records": count, "inserted": total}
+
+
 class TargetIndex:
     def __init__(self, database_path: str | Path):
         self.connection = sqlite3.connect(Path(database_path))
@@ -454,6 +516,45 @@ class TargetIndex:
 
     def __exit__(self, exc_type, exc_value, traceback) -> None:
         self.close()
+
+    def get_record(self, entity_id: str) -> Optional[Dict[str, str]]:
+        """Look up a single raw target record by entity_id."""
+        row = self.connection.execute(
+            "SELECT entity_id, business_name, business_address, country "
+            "FROM raw_records WHERE entity_id=?",
+            (entity_id,),
+        ).fetchone()
+        if row is None:
+            return None
+        return dict(row)
+
+    def get_records_batch(self, entity_ids: Sequence[str]) -> Dict[str, Dict[str, str]]:
+        """Look up multiple raw target records. Returns {entity_id: record_dict}."""
+        if not entity_ids:
+            return {}
+        result: Dict[str, Dict[str, str]] = {}
+        chunk_size = 500
+        for start in range(0, len(entity_ids), chunk_size):
+            chunk = entity_ids[start:start + chunk_size]
+            placeholders = ",".join("?" * len(chunk))
+            rows = self.connection.execute(
+                f"SELECT entity_id, business_name, business_address, country "
+                f"FROM raw_records WHERE entity_id IN ({placeholders})",
+                chunk,
+            ).fetchall()
+            for row in rows:
+                result[row["entity_id"]] = dict(row)
+        return result
+
+    def has_raw_records(self) -> bool:
+        """Check if raw_records table exists and has data."""
+        try:
+            row = self.connection.execute(
+                "SELECT COUNT(*) FROM raw_records LIMIT 1"
+            ).fetchone()
+            return row[0] > 0
+        except sqlite3.OperationalError:
+            return False
 
     def sources(self) -> Tuple[str, ...]:
         rows = self.connection.execute(
